@@ -303,15 +303,34 @@ func onReady() {
 		}
 	}()
 
-	// 定时逻辑
+	// 定时逻辑：每分钟检查一次
 	go func() {
-		ticker := time.NewTicker(REMIND_GAP)
-		for range ticker.C {
-			remind()
+		ticker := time.NewTicker(1 * time.Minute)
+		for now := range ticker.C {
+			hour, minute := now.Hour(), now.Minute()
+			isWeekday := isWorkday(now)
+
+			// 工作日 18:00 发送下班提醒（仅一次）
+			if isWeekday && hour == 18 && minute == 0 {
+				go remindOffWork()
+			} else if !isWeekday {
+				// 周末不发送喝水提醒
+				continue
+			} else {
+				// 工作日非18点，按间隔提醒
+				if minute%int(REMIND_GAP.Minutes()) == 0 {
+					go remind()
+				}
+			}
 		}
 	}()
 
 	go remind() // 启动先提醒一次
+}
+
+func isWorkday(t time.Time) bool {
+	weekday := t.Weekday()
+	return weekday != time.Saturday && weekday != time.Sunday
 }
 
 func onExit() {}
@@ -360,10 +379,72 @@ func retryWithBackoff(maxRetries int, initialDelay, maxDelay time.Duration, fn f
 
 func remind() {
 	msg := getLLMMessage()
-	// 调用系统通知，使用嵌入的图标数据（[]byte）
 	iconData := getNotificationIconData()
 	_ = beeep.Notify("喝水时间到！", msg, iconData)
 	fmt.Printf("[%s] 提醒内容: %s\n", time.Now().Format("15:04"), msg)
+}
+
+func remindOffWork() {
+	fmt.Printf("[%s] 【下班提醒】正在生成下班提醒文案...\n", time.Now().Format("15:04:05"))
+	msg := getOffWorkLLMMessage()
+	if msg == "" {
+		fmt.Printf("[%s] 【下班提醒】LLM 不可用，跳过下班提醒\n", time.Now().Format("15:04:05"))
+		return
+	}
+	iconData := getNotificationIconData()
+	_ = beeep.Notify("下班时间到！", msg, iconData)
+	fmt.Printf("[%s] 下班提醒内容: %s\n", time.Now().Format("15:04"), msg)
+}
+
+func getOffWorkLLMMessage() string {
+	fn := func() (string, error) {
+		config := openai.DefaultConfig(API_KEY)
+		config.BaseURL = BASE_URL
+
+		client := openai.NewClientWithConfig(config)
+
+		req := openai.ChatCompletionRequest{
+			Model: MODEL_NAME,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleSystem,
+					Content: "你是一个贴心的下班提醒助手。请生成一句幽默、诙谐的下班提醒语，庆祝一天工作结束，字数20字以内。",
+				},
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: "请写一句简短有趣的下班提醒，催人下班的那种！",
+				},
+			},
+		}
+
+		fmt.Printf("[%s] 【下班 LLM 请求】\n", time.Now().Format("15:04:05"))
+
+		ctx, cancel := context.WithTimeout(context.Background(), REQUEST_TIMEOUT)
+		defer cancel()
+		resp, err := client.CreateChatCompletion(ctx, req)
+
+		if err != nil {
+			fmt.Printf("[%s] 【下班 LLM 错误】%v\n", time.Now().Format("15:04:05"), err)
+			return "", err
+		}
+
+		if len(resp.Choices) == 0 {
+			return "", fmt.Errorf("无返回结果")
+		}
+
+		content := resp.Choices[0].Message.Content
+		if content == "" {
+			return "", fmt.Errorf("响应内容为空")
+		}
+		return content, nil
+	}
+
+	result, err := retryWithBackoff(MAX_RETRIES, INITIAL_DELAY, MAX_DELAY, fn)
+	if err != nil {
+		fmt.Printf("[%s] 【下班 LLM 最终失败】%v\n", time.Now().Format("15:04:05"), err)
+		return ""
+	}
+	return result
 }
 
 // 使用 OpenAI 兼容接口生成文案
