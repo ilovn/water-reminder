@@ -313,11 +313,11 @@ func onReady() {
 		}
 	}()
 
-	// 下班提醒定时器（每天 18:00，仅工作日）
+	// 下班提醒定时器（每天 18:30，仅工作日）
 	go func() {
 		for {
 			now := time.Now()
-			target := time.Date(now.Year(), now.Month(), now.Day(), 18, 0, 0, 0, now.Location())
+			target := time.Date(now.Year(), now.Month(), now.Day(), 18, 30, 0, 0, now.Location())
 			if now.After(target) {
 				target = target.Add(24 * time.Hour)
 			}
