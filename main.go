@@ -303,24 +303,29 @@ func onReady() {
 		}
 	}()
 
-	// 定时逻辑：每分钟检查一次
+	// 喝水提醒定时器（按配置间隔，仅工作日）
 	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
+		ticker := time.NewTicker(REMIND_GAP)
 		for now := range ticker.C {
-			hour, minute := now.Hour(), now.Minute()
-			isWeekday := isWorkday(now)
+			if isWorkday(now) {
+				go remind()
+			}
+		}
+	}()
 
-			// 工作日 18:00 发送下班提醒（仅一次）
-			if isWeekday && hour == 18 && minute == 0 {
+	// 下班提醒定时器（每天 18:00，仅工作日）
+	go func() {
+		for {
+			now := time.Now()
+			target := time.Date(now.Year(), now.Month(), now.Day(), 18, 0, 0, 0, now.Location())
+			if now.After(target) {
+				target = target.Add(24 * time.Hour)
+			}
+			timer := time.NewTimer(time.Until(target))
+			<-timer.C
+
+			if isWorkday(time.Now()) {
 				go remindOffWork()
-			} else if !isWeekday {
-				// 周末不发送喝水提醒
-				continue
-			} else {
-				// 工作日非18点，按间隔提醒
-				if minute%int(REMIND_GAP.Minutes()) == 0 {
-					go remind()
-				}
 			}
 		}
 	}()
