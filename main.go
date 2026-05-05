@@ -420,9 +420,12 @@ func getOffWorkLLMMessage() string {
 					Content: "请写一句简短有趣的下班提醒，催人下班的那种！",
 				},
 			},
+			ChatTemplateKwargs: map[string]any{
+				"enable_thinking": false,
+			},
 		}
 
-		fmt.Printf("[%s] 【下班 LLM 请求】\n", time.Now().Format("15:04:05"))
+		fmt.Printf("[%s] 【下班 LLM 请求】(推理已禁用)\n", time.Now().Format("15:04:05"))
 
 		ctx, cancel := context.WithTimeout(context.Background(), REQUEST_TIMEOUT)
 		defer cancel()
@@ -472,9 +475,12 @@ func getLLMMessage() string {
 					Content: "请写一句简短、有趣的喝水提醒。",
 				},
 			},
+			ChatTemplateKwargs: map[string]any{
+				"enable_thinking": false,
+			},
 		}
 
-		fmt.Printf("[%s] 【LLM 请求】\n", time.Now().Format("15:04:05"))
+		fmt.Printf("[%s] 【LLM 请求】(推理已禁用)\n", time.Now().Format("15:04:05"))
 		if reqBody, err := json.MarshalIndent(req, "", "  "); err == nil {
 			fmt.Printf("请求体: %s\n", string(reqBody))
 		} else {
