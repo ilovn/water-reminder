@@ -1,0 +1,45 @@
+# 二进制文件
+water-reminder
+water-reminder.exe
+water-reminder-*
+
+# 环境变量文件（包含敏感信息）
+.env
+.env.*
+.env.local
+.env.*.local
+
+# Go 文件
+*.o
+*.a
+*.so
+*.out
+*.test
+*.prof
+
+# macOS 文件
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE 文件
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# 编译产物
+build/
+dist/
+*.dmg
+*.deb
+*.rpm
+
+# 临时文件
+*.bak
+*.tmp
+temp/
+tmp/
