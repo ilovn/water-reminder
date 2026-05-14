@@ -10,9 +10,11 @@ import (
 	"image"
 	"image/png"
 	"io/fs"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gen2brain/beeep"
@@ -41,6 +43,29 @@ var (
 	MAX_DELAY       time.Duration                // 最大重试间隔
 	REQUEST_TIMEOUT time.Duration                // 请求超时时间
 	ICON_PATH       = "water_reminder_logo2.png" // 应用图标路径（嵌入到二进制中）
+)
+
+var (
+	lunchReminderActive  bool
+	lunchReminderMu      sync.Mutex
+	lunchPostponeTimer   *time.Timer
+	lunchAutoRemindTimer *time.Timer
+	lunchFirstRemind     bool
+	lunchRemindCount     int
+
+	dinnerReminderActive  bool
+	dinnerReminderMu      sync.Mutex
+	dinnerPostponeTimer   *time.Timer
+	dinnerAutoRemindTimer *time.Timer
+	dinnerFirstRemind     bool
+	dinnerRemindCount     int
+	dinnerSilentMode      int
+
+	postponeMenuItem   *systray.MenuItem
+	doneMenuItem       *systray.MenuItem
+	postpone10MenuItem *systray.MenuItem
+	postpone30MenuItem *systray.MenuItem
+	doneDinnerMenuItem *systray.MenuItem
 )
 
 func init() {
@@ -85,7 +110,7 @@ func loadEnvFile() {
 func initConfig() {
 	API_KEY = getEnvOrDefault("WATER_REMINDER_API_KEY", "__API_KEY_PLACEHOLDER__")
 	BASE_URL = getEnvOrDefault("WATER_REMINDER_BASE_URL", "__BASE_URL_PLACEHOLDER__")
-	MODEL_NAME = getEnvOrDefault("WATER_REMINDER_MODEL_NAME", "__MODEL_NAME_PLACEHOLDER__")
+	MODEL_NAME = getEnvOrDefault("WATER_REMINDER_MODEL_NAME", "qwen3:32b")
 	REMIND_GAP = getDurationEnv("WATER_REMINDER_REMIND_GAP", 35*time.Minute)
 	MAX_RETRIES = getIntEnv("WATER_REMINDER_MAX_RETRIES", 3)
 	INITIAL_DELAY = getDurationEnv("WATER_REMINDER_INITIAL_DELAY", 1*time.Second)
@@ -166,8 +191,59 @@ var fallbackMessages = []string{
 	"🧠 脑子转不动？也许只是缺水了！",
 }
 
+var lunchFallbackMessages = []string{
+	"🍛 午餐时间快到啦！该订餐啦~",
+	"🥡 十一点啦！还不赶紧订午餐？",
+	"🍱 肚子在咕咕叫，快去选外卖！",
+	"🍔 午餐订餐时间到，选个好吃的吧！",
+	"🌮 今天中午吃点啥？赶紧下单！",
+	"🥗 别等到饿了才订餐，提前行动！",
+	"🍝 午餐时间即将到来，订餐走起！",
+	"🍣 赶紧订午餐，不然要排队啦！",
+	"🌯 十一点五十五，订餐别耽误！",
+	"🍲 美味午餐在等你，快去下单！",
+}
+
 func getRandomFallbackMessage() string {
 	return fallbackMessages[time.Now().UnixNano()%int64(len(fallbackMessages))]
+}
+
+func getRandomLunchFallbackMessage() string {
+	return lunchFallbackMessages[time.Now().UnixNano()%int64(len(lunchFallbackMessages))]
+}
+
+func cleanResponse(content string) string {
+	content = strings.TrimSpace(content)
+
+	if idx := strings.Index(content, "\""); idx != -1 {
+		endIdx := strings.LastIndex(content, "\"")
+		if endIdx > idx {
+			return strings.TrimSpace(content[idx+1 : endIdx])
+		}
+	}
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) <= 80 && !strings.Contains(line, ":") && !strings.Contains(line, "：") {
+			return line
+		}
+	}
+
+	if len(content) <= 80 {
+		return content
+	}
+	return content[:80]
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func pngToIco(pngData []byte) ([]byte, error) {
@@ -194,6 +270,7 @@ func pngToIco(pngData []byte) ([]byte, error) {
 
 func main() {
 	helpFlag := flag.Bool("help", false, "显示帮助信息")
+	noGUIFlag := flag.Bool("nogui", false, "不启动图形界面，仅运行HTTP服务器用于测试")
 	flag.Parse()
 
 	beeep.AppName = "喝了么"
@@ -203,7 +280,86 @@ func main() {
 		return
 	}
 
+	go startHTTPServer()
+
+	if *noGUIFlag {
+		fmt.Printf("[%s] 【模式】无GUI模式运行，按 Ctrl+C 退出\n", time.Now().Format("15:04:05"))
+		select {}
+	}
+
 	systray.Run(onReady, onExit)
+}
+
+func startHTTPServer() {
+	http.HandleFunc("/lunch/trigger", handleLunchTrigger)
+	http.HandleFunc("/lunch/postpone", handleLunchPostpone)
+	http.HandleFunc("/lunch/done", handleLunchDone)
+
+	fmt.Printf("[%s] 【HTTP 服务器】启动于 http://localhost:8085\n", time.Now().Format("15:04:05"))
+	if err := http.ListenAndServe(":8085", nil); err != nil && err != http.ErrServerClosed {
+		fmt.Printf("[%s] 【HTTP 服务器错误】%v\n", time.Now().Format("15:04:05"), err)
+	}
+}
+
+func handleLunchTrigger(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	go remindLunch()
+
+	fmt.Printf("[%s] 【午餐提醒】通过HTTP接口触发\n", time.Now().Format("15:04:05"))
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "午餐提醒已触发")
+}
+
+func handleLunchPostpone(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	lunchReminderMu.Lock()
+	if lunchReminderActive {
+		lunchReminderActive = false
+		if lunchPostponeTimer != nil {
+			lunchPostponeTimer.Stop()
+		}
+		lunchPostponeTimer = time.AfterFunc(5*time.Minute, func() {
+			go remindLunch()
+		})
+		fmt.Printf("[%s] 【午餐提醒】用户选择5分钟后再提醒\n", time.Now().Format("15:04:05"))
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "已推迟5分钟")
+	} else {
+		fmt.Printf("[%s] 【午餐提醒】无活动提醒，跳过推迟操作\n", time.Now().Format("15:04:05"))
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "当前无活动的午餐提醒，可先调用 /lunch/trigger 触发提醒")
+	}
+	lunchReminderMu.Unlock()
+}
+
+func handleLunchDone(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	lunchReminderMu.Lock()
+	lunchReminderActive = false
+	if lunchPostponeTimer != nil {
+		lunchPostponeTimer.Stop()
+		lunchPostponeTimer = nil
+		fmt.Printf("[%s] 【午餐提醒】用户已订餐，取消推迟定时器\n", time.Now().Format("15:04:05"))
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "已取消推迟提醒，祝你用餐愉快！")
+	} else {
+		fmt.Printf("[%s] 【午餐提醒】用户已订餐\n", time.Now().Format("15:04:05"))
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "祝你用餐愉快！")
+	}
+	lunchReminderMu.Unlock()
 }
 
 func printHelp() {
@@ -255,7 +411,7 @@ func printHelp() {
   编译前可通过 sed 替换占位符设置默认值:
     sed -i.bak 's/__API_KEY_PLACEHOLDER__/your-api-key/g' main.go
     sed -i.bak 's/__BASE_URL_PLACEHOLDER__/https://your-api-url/g' main.go
-    sed -i.bak 's/__MODEL_NAME_PLACEHOLDER__/qwen3:32b/g' main.go
+    sed -i.bak 's/qwen3:32b/qwen3:32b/g' main.go
 
 示例:
   ./water-reminder                              # 使用默认配置启动
@@ -290,6 +446,27 @@ func onReady() {
 	}
 
 	mNow := systray.AddMenuItem("立即提醒", "立刻生成一条提醒")
+	mLunch := systray.AddMenuItem("午餐提醒", "测试午餐订餐提醒")
+	mDinner := systray.AddMenuItem("下班提醒", "测试下班提醒")
+	systray.AddSeparator()
+
+	postponeMenuItem = systray.AddMenuItem("🍱 我在忙，五分钟后提醒", "5分钟后再次提醒")
+	doneMenuItem = systray.AddMenuItem("✅ 已经订了", "确认已订餐")
+
+	postponeMenuItem.Hide()
+	doneMenuItem.Hide()
+
+	systray.AddSeparator()
+
+	postpone10MenuItem = systray.AddMenuItem("⏰ 再忙10分钟", "10分钟后再次提醒")
+	postpone30MenuItem = systray.AddMenuItem("⏱️ 再忙30分钟", "30分钟后再次提醒")
+	doneDinnerMenuItem = systray.AddMenuItem("🏠 已经下班", "确认已下班")
+
+	postpone10MenuItem.Hide()
+	postpone30MenuItem.Hide()
+	doneDinnerMenuItem.Hide()
+
+	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("退出", "关闭程序")
 
 	go func() {
@@ -299,6 +476,20 @@ func onReady() {
 				systray.Quit()
 			case <-mNow.ClickedCh:
 				go remind()
+			case <-mLunch.ClickedCh:
+				go remindLunch()
+			case <-mDinner.ClickedCh:
+				go remindDinner()
+			case <-postponeMenuItem.ClickedCh:
+				go handlePostponeClick()
+			case <-doneMenuItem.ClickedCh:
+				go handleDoneClick()
+			case <-postpone10MenuItem.ClickedCh:
+				go handleDinnerPostponeClick(10)
+			case <-postpone30MenuItem.ClickedCh:
+				go handleDinnerPostponeClick(30)
+			case <-doneDinnerMenuItem.ClickedCh:
+				go handleDinnerDoneClick()
 			}
 		}
 	}()
@@ -313,11 +504,11 @@ func onReady() {
 		}
 	}()
 
-	// 下班提醒定时器（每天 18:30，仅工作日）
+	// 午餐提醒定时器（每天 10:55，仅工作日）
 	go func() {
 		for {
 			now := time.Now()
-			target := time.Date(now.Year(), now.Month(), now.Day(), 18, 30, 0, 0, now.Location())
+			target := time.Date(now.Year(), now.Month(), now.Day(), 10, 55, 0, 0, now.Location())
 			if now.After(target) {
 				target = target.Add(24 * time.Hour)
 			}
@@ -325,7 +516,24 @@ func onReady() {
 			<-timer.C
 
 			if isWorkday(time.Now()) {
-				go remindOffWork()
+				go remindLunch()
+			}
+		}
+	}()
+
+	// 下班提醒定时器（每天 18:05，仅工作日）
+	go func() {
+		for {
+			now := time.Now()
+			target := time.Date(now.Year(), now.Month(), now.Day(), 18, 5, 0, 0, now.Location())
+			if now.After(target) {
+				target = target.Add(24 * time.Hour)
+			}
+			timer := time.NewTimer(time.Until(target))
+			<-timer.C
+
+			if isWorkday(time.Now()) {
+				go remindDinner()
 			}
 		}
 	}()
@@ -413,11 +621,11 @@ func getOffWorkLLMMessage() string {
 			Messages: []openai.ChatCompletionMessage{
 				{
 					Role:    openai.ChatMessageRoleSystem,
-					Content: "你是一个贴心的下班提醒助手。请生成一句幽默、诙谐的下班提醒语，庆祝一天工作结束，字数20字以内。",
+					Content: "你是一个简洁的提醒助手。只返回一句简短幽默的下班提醒语，不超过20字，直接给出结果，不要解释，不要列表，不要选项。",
 				},
 				{
 					Role:    openai.ChatMessageRoleUser,
-					Content: "请写一句简短有趣的下班提醒，催人下班的那种！",
+					Content: "下班提醒",
 				},
 			},
 			ChatTemplateKwargs: map[string]any{
@@ -444,7 +652,7 @@ func getOffWorkLLMMessage() string {
 		if content == "" {
 			return "", fmt.Errorf("响应内容为空")
 		}
-		return content, nil
+		return cleanResponse(content), nil
 	}
 
 	result, err := retryWithBackoff(MAX_RETRIES, INITIAL_DELAY, MAX_DELAY, fn)
@@ -468,11 +676,11 @@ func getLLMMessage() string {
 			Messages: []openai.ChatCompletionMessage{
 				{
 					Role:    openai.ChatMessageRoleSystem,
-					Content: "你是一个贴心的健康助手。请生成一句短小、幽默且富有创意的喝水提醒语,字数20字以内。",
+					Content: "你是一个简洁的提醒助手。只返回一句简短幽默的喝水提醒语，不超过20字，直接给出结果，不要解释，不要列表，不要选项。",
 				},
 				{
 					Role:    openai.ChatMessageRoleUser,
-					Content: "请写一句简短、有趣的喝水提醒。",
+					Content: "喝水提醒",
 				},
 			},
 			ChatTemplateKwargs: map[string]any{
@@ -515,7 +723,7 @@ func getLLMMessage() string {
 			fmt.Println("警告: 响应内容为空")
 			return "", fmt.Errorf("响应内容为空")
 		}
-		return content, nil
+		return cleanResponse(content), nil
 	}
 
 	result, err := retryWithBackoff(MAX_RETRIES, INITIAL_DELAY, MAX_DELAY, fn)
@@ -525,4 +733,318 @@ func getLLMMessage() string {
 		return getRandomFallbackMessage()
 	}
 	return result
+}
+
+func remindLunch() {
+	lunchReminderMu.Lock()
+
+	now := time.Now()
+	hour, minute := now.Hour(), now.Minute()
+
+	if hour >= 11 && minute >= 55 {
+		lunchReminderActive = false
+		lunchRemindCount = 0
+		lunchFirstRemind = false
+		stopLunchTimers()
+
+		iconData := getNotificationIconData()
+		_ = beeep.Notify("午餐时间过了 😢", "好吧...看来你今天不想订餐了，祝你下午工作愉快！", iconData)
+		fmt.Printf("[%s] 【午餐提醒】幽怨提示：用户一直没订餐\n", time.Now().Format("15:04:05"))
+		lunchReminderMu.Unlock()
+		return
+	}
+
+	lunchReminderActive = true
+	lunchRemindCount++
+
+	if !lunchFirstRemind {
+		lunchFirstRemind = true
+	}
+
+	lunchReminderMu.Unlock()
+
+	msg := getLunchLLMMessage()
+	iconData := getNotificationIconData()
+
+	fmt.Printf("[%s] 【午餐提醒】第%d次提醒: %s\n", time.Now().Format("15:04:05"), lunchRemindCount, msg)
+
+	postponeMenuItem.Show()
+	doneMenuItem.Show()
+
+	var notificationMsg string
+	if runtime.GOOS == "windows" {
+		notificationMsg = fmt.Sprintf("%s\n\n💡 点击托盘图标选择操作", msg)
+	} else {
+		notificationMsg = fmt.Sprintf("%s\n\n💡 点击托盘图标选择:\n• 我在忙，五分钟后提醒\n• 已经订了", msg)
+	}
+	_ = beeep.Notify("午餐时间到！", notificationMsg, iconData)
+
+	setAutoRemindTimer()
+}
+
+func setAutoRemindTimer() {
+	lunchReminderMu.Lock()
+	defer lunchReminderMu.Unlock()
+
+	if lunchAutoRemindTimer != nil {
+		lunchAutoRemindTimer.Stop()
+	}
+
+	var delay time.Duration
+	if lunchFirstRemind && lunchRemindCount == 1 {
+		delay = 5 * time.Minute
+	} else {
+		delay = 10 * time.Minute
+	}
+
+	lunchAutoRemindTimer = time.AfterFunc(delay, func() {
+		go remindLunch()
+	})
+	fmt.Printf("[%s] 【午餐提醒】设置自动提醒，%d分钟后\n", time.Now().Format("15:04:05"), delay/time.Minute)
+}
+
+func stopLunchTimers() {
+	if lunchPostponeTimer != nil {
+		lunchPostponeTimer.Stop()
+		lunchPostponeTimer = nil
+	}
+	if lunchAutoRemindTimer != nil {
+		lunchAutoRemindTimer.Stop()
+		lunchAutoRemindTimer = nil
+	}
+}
+
+func handlePostponeClick() {
+	lunchReminderMu.Lock()
+	stopLunchTimers()
+
+	lunchPostponeTimer = time.AfterFunc(5*time.Minute, func() {
+		go remindLunch()
+	})
+	fmt.Printf("[%s] 【午餐提醒】用户选择5分钟后再提醒\n", time.Now().Format("15:04:05"))
+
+	postponeMenuItem.Hide()
+	doneMenuItem.Hide()
+
+	iconData := getNotificationIconData()
+	_ = beeep.Notify("提醒已推迟", "5分钟后再次提醒您订餐", iconData)
+	lunchReminderMu.Unlock()
+}
+
+func handleDoneClick() {
+	lunchReminderMu.Lock()
+	lunchReminderActive = false
+	lunchRemindCount = 0
+	lunchFirstRemind = false
+	stopLunchTimers()
+
+	fmt.Printf("[%s] 【午餐提醒】用户已订餐\n", time.Now().Format("15:04:05"))
+
+	postponeMenuItem.Hide()
+	doneMenuItem.Hide()
+
+	lunchReminderMu.Unlock()
+
+	iconData := getNotificationIconData()
+	_ = beeep.Notify("用餐愉快！", "祝你用餐愉快！", iconData)
+}
+
+func getLunchLLMMessage() string {
+	fn := func() (string, error) {
+		config := openai.DefaultConfig(API_KEY)
+		config.BaseURL = BASE_URL
+
+		client := openai.NewClientWithConfig(config)
+
+		req := openai.ChatCompletionRequest{
+			Model: MODEL_NAME,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleSystem,
+					Content: "你是一个简洁的提醒助手。只返回一句简短幽默的午餐订餐提醒语，不超过20字，直接给出结果，不要解释，不要列表，不要选项。",
+				},
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: "午餐订餐提醒",
+				},
+			},
+			ChatTemplateKwargs: map[string]any{
+				"enable_thinking": false,
+			},
+		}
+
+		fmt.Printf("[%s] 【午餐 LLM 请求】(推理已禁用)\n", time.Now().Format("15:04:05"))
+		if reqBody, err := json.MarshalIndent(req, "", "  "); err == nil {
+			fmt.Printf("请求体: %s\n", string(reqBody))
+		} else {
+			fmt.Printf("模型: %s, 消息数: %d\n", req.Model, len(req.Messages))
+		}
+
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), REQUEST_TIMEOUT)
+		defer cancel()
+		resp, err := client.CreateChatCompletion(ctx, req)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			fmt.Printf("[%s] 【午餐 LLM 错误】耗时: %v, 错误: %v\n", time.Now().Format("15:04:05"), elapsed, err)
+			return "", err
+		}
+
+		fmt.Printf("[%s] 【午餐 LLM 响应】耗时: %v\n", time.Now().Format("15:04:05"), elapsed)
+		if len(resp.Choices) == 0 {
+			fmt.Println("响应: 无返回结果")
+			return "", fmt.Errorf("无返回结果")
+		}
+
+		if respBody, err := json.MarshalIndent(resp, "", "  "); err == nil {
+			fmt.Printf("响应体: %s\n", string(respBody))
+		} else {
+			fmt.Printf("响应: %s\n", resp.Choices[0].Message.Content)
+		}
+
+		content := resp.Choices[0].Message.Content
+		if content == "" {
+			fmt.Println("警告: 响应内容为空")
+			return "", fmt.Errorf("响应内容为空")
+		}
+		return cleanResponse(content), nil
+	}
+
+	result, err := retryWithBackoff(MAX_RETRIES, INITIAL_DELAY, MAX_DELAY, fn)
+	if err != nil {
+		fmt.Printf("[%s] 【午餐 LLM 最终失败】%v\n", time.Now().Format("15:04:05"), err)
+		fmt.Printf("[%s] 【备用方案】使用内置随机提醒语\n", time.Now().Format("15:04:05"))
+		return getRandomLunchFallbackMessage()
+	}
+	return result
+}
+
+func remindDinner() {
+	dinnerReminderMu.Lock()
+
+	now := time.Now()
+	hour := now.Hour()
+
+	if hour >= 22 {
+		dinnerReminderActive = false
+		dinnerRemindCount = 0
+		dinnerFirstRemind = false
+		dinnerSilentMode = 0
+		stopDinnerTimers()
+
+		iconData := getNotificationIconData()
+		_ = beeep.Notify("看来你今天不下班了 😢", "注意身体！工作再忙也要照顾好自己，早点休息！", iconData)
+		fmt.Printf("[%s] 【下班提醒】幽怨提示：用户一直没下班\n", time.Now().Format("15:04:05"))
+		dinnerReminderMu.Unlock()
+		return
+	}
+
+	dinnerReminderActive = true
+	dinnerRemindCount++
+
+	if !dinnerFirstRemind {
+		dinnerFirstRemind = true
+	}
+
+	dinnerReminderMu.Unlock()
+
+	msg := getOffWorkLLMMessage()
+	if msg == "" {
+		fmt.Printf("[%s] 【下班提醒】LLM 不可用，使用备用文案\n", time.Now().Format("15:04:05"))
+		msg = "工作辛苦了，该下班啦！"
+	}
+	iconData := getNotificationIconData()
+
+	fmt.Printf("[%s] 【下班提醒】第%d次提醒: %s\n", time.Now().Format("15:04:05"), dinnerRemindCount, msg)
+
+	postpone10MenuItem.Show()
+	postpone30MenuItem.Show()
+	doneDinnerMenuItem.Show()
+
+	var notificationMsg string
+	if runtime.GOOS == "windows" {
+		notificationMsg = fmt.Sprintf("%s\n\n💡 点击托盘图标选择操作", msg)
+	} else {
+		notificationMsg = fmt.Sprintf("%s\n\n💡 点击托盘图标选择:\n• 再忙10分钟\n• 再忙30分钟\n• 已经下班", msg)
+	}
+	_ = beeep.Notify("下班时间到！", notificationMsg, iconData)
+
+	setDinnerAutoRemindTimer()
+}
+
+func setDinnerAutoRemindTimer() {
+	dinnerReminderMu.Lock()
+	defer dinnerReminderMu.Unlock()
+
+	if dinnerAutoRemindTimer != nil {
+		dinnerAutoRemindTimer.Stop()
+	}
+
+	var delay time.Duration
+	if dinnerSilentMode == 10 {
+		delay = 10 * time.Minute
+	} else if dinnerSilentMode == 30 {
+		delay = 30 * time.Minute
+	} else if dinnerFirstRemind && dinnerRemindCount == 1 {
+		delay = 10 * time.Minute
+	} else {
+		delay = 30 * time.Minute
+	}
+
+	dinnerAutoRemindTimer = time.AfterFunc(delay, func() {
+		go remindDinner()
+	})
+	fmt.Printf("[%s] 【下班提醒】设置自动提醒，%d分钟后\n", time.Now().Format("15:04:05"), delay/time.Minute)
+}
+
+func stopDinnerTimers() {
+	if dinnerPostponeTimer != nil {
+		dinnerPostponeTimer.Stop()
+		dinnerPostponeTimer = nil
+	}
+	if dinnerAutoRemindTimer != nil {
+		dinnerAutoRemindTimer.Stop()
+		dinnerAutoRemindTimer = nil
+	}
+}
+
+func handleDinnerPostponeClick(minutes int) {
+	dinnerReminderMu.Lock()
+	stopDinnerTimers()
+
+	dinnerSilentMode = minutes
+	dinnerPostponeTimer = time.AfterFunc(time.Duration(minutes)*time.Minute, func() {
+		dinnerSilentMode = 0
+		go remindDinner()
+	})
+	fmt.Printf("[%s] 【下班提醒】用户选择%d分钟后再提醒\n", time.Now().Format("15:04:05"), minutes)
+
+	postpone10MenuItem.Hide()
+	postpone30MenuItem.Hide()
+	doneDinnerMenuItem.Hide()
+
+	iconData := getNotificationIconData()
+	_ = beeep.Notify("休息一下", fmt.Sprintf("%d分钟后再次提醒您下班", minutes), iconData)
+	dinnerReminderMu.Unlock()
+}
+
+func handleDinnerDoneClick() {
+	dinnerReminderMu.Lock()
+	dinnerReminderActive = false
+	dinnerRemindCount = 0
+	dinnerFirstRemind = false
+	dinnerSilentMode = 0
+	stopDinnerTimers()
+
+	fmt.Printf("[%s] 【下班提醒】用户已下班\n", time.Now().Format("15:04:05"))
+
+	postpone10MenuItem.Hide()
+	postpone30MenuItem.Hide()
+	doneDinnerMenuItem.Hide()
+
+	dinnerReminderMu.Unlock()
+
+	iconData := getNotificationIconData()
+	_ = beeep.Notify("下班愉快！", "祝你度过一个愉快的夜晚！", iconData)
 }
