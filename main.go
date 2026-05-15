@@ -193,14 +193,14 @@ var fallbackMessages = []string{
 
 var lunchFallbackMessages = []string{
 	"🍛 午餐时间快到啦！该订餐啦~",
-	"🥡 十一点啦！还不赶紧订午餐？",
+	"🥡 还不赶紧订午餐？",
 	"🍱 肚子在咕咕叫，快去选外卖！",
 	"🍔 午餐订餐时间到，选个好吃的吧！",
 	"🌮 今天中午吃点啥？赶紧下单！",
 	"🥗 别等到饿了才订餐，提前行动！",
 	"🍝 午餐时间即将到来，订餐走起！",
 	"🍣 赶紧订午餐，不然要排队啦！",
-	"🌯 十一点五十五，订餐别耽误！",
+	"🌯 订餐别耽误！",
 	"🍲 美味午餐在等你，快去下单！",
 }
 
@@ -217,6 +217,18 @@ var morningFallbackMessages = []string{
 	"🏃 早安！活力满满迎接新一天！",
 }
 
+var offworkFallbackMessages = []string{
+	"🏠 下班啦！赶紧收拾东西回家~",
+	"🎉 工作结束！享受美好时光吧~",
+	"🌙 下班时间到！准备迎接夜晚~",
+	"🍻 辛苦了一天！该放松放松了~",
+	"🚶 下班啦！迈着轻快的步伐回家~",
+	"🍔 下班了！去吃顿好的犒劳自己~",
+	"🛋️ 下班啦！回家瘫在沙发上~",
+	"🌆 下班时间！享受城市的傍晚~",
+	"🎊 终于下班啦！今天辛苦啦~",
+}
+
 func getRandomFallbackMessage() string {
 	return fallbackMessages[time.Now().UnixNano()%int64(len(fallbackMessages))]
 }
@@ -227,6 +239,10 @@ func getRandomLunchFallbackMessage() string {
 
 func getRandomMorningFallbackMessage() string {
 	return morningFallbackMessages[time.Now().UnixNano()%int64(len(morningFallbackMessages))]
+}
+
+func getRandomOffworkFallbackMessage() string {
+	return offworkFallbackMessages[time.Now().UnixNano()%int64(len(offworkFallbackMessages))]
 }
 
 func cleanResponse(content string) string {
@@ -427,7 +443,7 @@ func printHelp() {
 打包说明:
   编译前可通过 sed 替换占位符设置默认值:
     sed -i.bak 's/__API_KEY_PLACEHOLDER__/your-api-key/g' main.go
-    sed -i.bak 's/__BASE_URL_PLACEHOLDER__/https://your-api-url/g' main.go
+    sed -i.bak 's/http://xxxx/api/openai/94877/app_rwe2qrdl/v1/https://your-api-url/g' main.go
     sed -i.bak 's/qwen3:32b/qwen3:32b/g' main.go
 
 示例:
@@ -638,8 +654,8 @@ func remindOffWork() {
 	fmt.Printf("[%s] 【下班提醒】正在生成下班提醒文案...\n", time.Now().Format("15:04:05"))
 	msg := getOffWorkLLMMessage()
 	if msg == "" {
-		fmt.Printf("[%s] 【下班提醒】LLM 不可用，跳过下班提醒\n", time.Now().Format("15:04:05"))
-		return
+		fmt.Printf("[%s] 【下班提醒】LLM 不可用，使用备用文案\n", time.Now().Format("15:04:05"))
+		msg = getRandomOffworkFallbackMessage()
 	}
 	iconData := getNotificationIconData()
 	_ = beeep.Notify("下班时间到！", msg, iconData)
@@ -695,7 +711,8 @@ func getOffWorkLLMMessage() string {
 	result, err := retryWithBackoff(MAX_RETRIES, INITIAL_DELAY, MAX_DELAY, fn)
 	if err != nil {
 		fmt.Printf("[%s] 【下班 LLM 最终失败】%v\n", time.Now().Format("15:04:05"), err)
-		return ""
+		fmt.Printf("[%s] 【备用方案】使用内置随机提醒语\n", time.Now().Format("15:04:05"))
+		return getRandomOffworkFallbackMessage()
 	}
 	return result
 }
