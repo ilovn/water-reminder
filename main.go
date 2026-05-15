@@ -443,7 +443,7 @@ func printHelp() {
 打包说明:
   编译前可通过 sed 替换占位符设置默认值:
     sed -i.bak 's/__API_KEY_PLACEHOLDER__/your-api-key/g' main.go
-    sed -i.bak 's/http://xxxx/api/openai/94877/app_rwe2qrdl/v1/https://your-api-url/g' main.go
+    sed -i.bak 's/http://xxxx/api//https://your-api-url/g' main.go
     sed -i.bak 's/qwen3:32b/qwen3:32b/g' main.go
 
 示例:
