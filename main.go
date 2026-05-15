@@ -204,12 +204,29 @@ var lunchFallbackMessages = []string{
 	"🍲 美味午餐在等你，快去下单！",
 }
 
+var morningFallbackMessages = []string{
+	"☀️ 新的一天，元气满满~",
+	"🌅 早安！今天也要加油哦~",
+	"🚀 开工啦！让我们一起冲！",
+	"💪 早安！充满活力的一天开始了~",
+	"🌸 早上好！愿你今天心情愉快~",
+	"🎯 新的一天，新的目标！加油！",
+	"🌈 早安！美好的一天开始了~",
+	"⚡ 早安！电量已满，开始工作！",
+	"🌻 早上好！愿你今天事事顺利~",
+	"🏃 早安！活力满满迎接新一天！",
+}
+
 func getRandomFallbackMessage() string {
 	return fallbackMessages[time.Now().UnixNano()%int64(len(fallbackMessages))]
 }
 
 func getRandomLunchFallbackMessage() string {
 	return lunchFallbackMessages[time.Now().UnixNano()%int64(len(lunchFallbackMessages))]
+}
+
+func getRandomMorningFallbackMessage() string {
+	return morningFallbackMessages[time.Now().UnixNano()%int64(len(morningFallbackMessages))]
 }
 
 func cleanResponse(content string) string {
@@ -1070,8 +1087,67 @@ func handleDinnerDoneClick() {
 }
 
 func remindMorning() {
-	fmt.Printf("[%s] 【上班提醒】新的一天，元气满满~\n", time.Now().Format("15:04:05"))
-
+	fmt.Printf("[%s] 【上班提醒】正在生成上班提醒文案...\n", time.Now().Format("15:04:05"))
+	msg := getMorningLLMMessage()
+	if msg == "" {
+		fmt.Printf("[%s] 【上班提醒】LLM 不可用，使用备用文案\n", time.Now().Format("15:04:05"))
+		msg = getRandomMorningFallbackMessage()
+	}
 	iconData := getNotificationIconData()
-	_ = beeep.Notify("早安！", "新的一天，元气满满~", iconData)
+	_ = beeep.Notify("早安！", msg, iconData)
+	fmt.Printf("[%s] 上班提醒内容: %s\n", time.Now().Format("15:04"), msg)
+}
+
+func getMorningLLMMessage() string {
+	fn := func() (string, error) {
+		config := openai.DefaultConfig(API_KEY)
+		config.BaseURL = BASE_URL
+
+		client := openai.NewClientWithConfig(config)
+
+		req := openai.ChatCompletionRequest{
+			Model: MODEL_NAME,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleSystem,
+					Content: "你是一个简洁的提醒助手。只返回一句简短幽默的上班提醒语，不超过20字，直接给出结果，不要解释，不要列表，不要选项。",
+				},
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: "上班提醒",
+				},
+			},
+			ChatTemplateKwargs: map[string]any{
+				"enable_thinking": false,
+			},
+		}
+
+		fmt.Printf("[%s] 【上班 LLM 请求】(推理已禁用)\n", time.Now().Format("15:04:05"))
+
+		ctx, cancel := context.WithTimeout(context.Background(), REQUEST_TIMEOUT)
+		defer cancel()
+		resp, err := client.CreateChatCompletion(ctx, req)
+
+		if err != nil {
+			fmt.Printf("[%s] 【上班 LLM 错误】%v\n", time.Now().Format("15:04:05"), err)
+			return "", err
+		}
+
+		if len(resp.Choices) == 0 {
+			return "", fmt.Errorf("无返回结果")
+		}
+
+		content := resp.Choices[0].Message.Content
+		if content == "" {
+			return "", fmt.Errorf("响应内容为空")
+		}
+		return cleanResponse(content), nil
+	}
+
+	result, err := retryWithBackoff(MAX_RETRIES, INITIAL_DELAY, MAX_DELAY, fn)
+	if err != nil {
+		fmt.Printf("[%s] 【上班 LLM 最终失败】%v\n", time.Now().Format("15:04:05"), err)
+		return ""
+	}
+	return result
 }
