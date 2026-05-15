@@ -446,6 +446,7 @@ func onReady() {
 	}
 
 	mNow := systray.AddMenuItem("立即提醒", "立刻生成一条提醒")
+	mMorning := systray.AddMenuItem("上班提醒", "测试上班提醒")
 	mLunch := systray.AddMenuItem("午餐提醒", "测试午餐订餐提醒")
 	mDinner := systray.AddMenuItem("下班提醒", "测试下班提醒")
 	systray.AddSeparator()
@@ -476,6 +477,8 @@ func onReady() {
 				systray.Quit()
 			case <-mNow.ClickedCh:
 				go remind()
+			case <-mMorning.ClickedCh:
+				go remindMorning()
 			case <-mLunch.ClickedCh:
 				go remindLunch()
 			case <-mDinner.ClickedCh:
@@ -490,6 +493,23 @@ func onReady() {
 				go handleDinnerPostponeClick(30)
 			case <-doneDinnerMenuItem.ClickedCh:
 				go handleDinnerDoneClick()
+			}
+		}
+	}()
+
+	// 上班提醒定时器（每天 09:00，仅工作日）
+	go func() {
+		for {
+			now := time.Now()
+			target := time.Date(now.Year(), now.Month(), now.Day(), 9, 0, 0, 0, now.Location())
+			if now.After(target) {
+				target = target.Add(24 * time.Hour)
+			}
+			timer := time.NewTimer(time.Until(target))
+			<-timer.C
+
+			if isWorkday(time.Now()) {
+				go remindMorning()
 			}
 		}
 	}()
@@ -1047,4 +1067,11 @@ func handleDinnerDoneClick() {
 
 	iconData := getNotificationIconData()
 	_ = beeep.Notify("下班愉快！", "祝你度过一个愉快的夜晚！", iconData)
+}
+
+func remindMorning() {
+	fmt.Printf("[%s] 【上班提醒】新的一天，元气满满~\n", time.Now().Format("15:04:05"))
+
+	iconData := getNotificationIconData()
+	_ = beeep.Notify("早安！", "新的一天，元气满满~", iconData)
 }
